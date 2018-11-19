@@ -19,7 +19,9 @@ fn enable_simd_optimizations() {
         return;
     }
 
+    println!("cargo:rustc-cfg=askama_runtime_simd");
     println!("cargo:rustc-cfg=askama_runtime_avx");
+    println!("cargo:rustc-cfg=askama_runtime_sse");
 }
 
 fn is_env_set(name: &str) -> bool {

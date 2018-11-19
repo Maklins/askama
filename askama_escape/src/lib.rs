@@ -63,16 +63,11 @@ impl<'a> Display for Escaped<'a> {
 }
 
 cfg_if! {
-    if #[cfg(all(target_arch = "x86_64", askama_runtime_avx))] {
+    if #[cfg(all(target_arch = "x86_64", askama_runtime_simd))] {
 
         use std::arch::x86_64::*;
         use std::mem::{self, size_of};
         use std::sync::atomic::{AtomicUsize, Ordering};
-
-        const VECTOR_SIZE: usize = size_of::<__m256i>();
-        const VECTOR_ALIGN: usize = VECTOR_SIZE - 1;
-
-        const LOOP_SIZE: usize = 2 * VECTOR_SIZE;
 
         #[inline(always)]
         fn _imp(bytes: &[u8], fmt: &mut Formatter) -> fmt::Result {
@@ -80,8 +75,10 @@ cfg_if! {
             static mut FN: fn(bytes: &[u8], fmt: &mut Formatter) -> fmt::Result = detect;
 
             fn detect(bytes: &[u8], fmt: &mut Formatter) -> fmt::Result {
-                let fun = if is_x86_feature_detected!("avx2") {
+                let fun = if cfg!(askama_runtime_avx) && is_x86_feature_detected!("avx2") {
                     _avx_escape as usize
+                } else if cfg!(askama_runtime_sse) {
+                    _sse_escape as usize
                 } else {
                     _escape as usize
                 };
@@ -117,7 +114,7 @@ cfg_if! {
 }
 
 macro_rules! escaping_body {
-    ($i:ident, $start:ident, $fmt:ident, $bytes:ident, $quote:expr) => {{
+    ($i:expr, $start:ident, $fmt:ident, $bytes:ident, $quote:expr) => {{
         if $start < $i {
             #[allow(unused_unsafe)]
             $fmt.write_str(unsafe { str::from_utf8_unchecked(&$bytes[$start..$i]) })?;
@@ -127,19 +124,19 @@ macro_rules! escaping_body {
     }};
 }
 
-macro_rules! escaping_bodies {
-    ($i:ident, $b: ident, $start:ident, $fmt:ident, $bytes:ident) => {{
+macro_rules! bodies {
+    ($i:expr, $b: ident, $start:ident, $fmt:ident, $bytes:ident, $callback:ident) => {
         // Unsafe
         match $b {
-            b'<' => escaping_body!($i, $start, $fmt, $bytes, "&lt;"),
-            b'>' => escaping_body!($i, $start, $fmt, $bytes, "&gt;"),
-            b'&' => escaping_body!($i, $start, $fmt, $bytes, "&amp;"),
-            b'"' => escaping_body!($i, $start, $fmt, $bytes, "&quot;"),
-            b'\'' => escaping_body!($i, $start, $fmt, $bytes, "&#x27;"),
-            b'/' => escaping_body!($i, $start, $fmt, $bytes, "&#x2f;"),
+            b'<' => $callback!($i, $start, $fmt, $bytes, "&lt;"),
+            b'>' => $callback!($i, $start, $fmt, $bytes, "&gt;"),
+            b'&' => $callback!($i, $start, $fmt, $bytes, "&amp;"),
+            b'"' => $callback!($i, $start, $fmt, $bytes, "&quot;"),
+            b'\'' => $callback!($i, $start, $fmt, $bytes, "&#x27;"),
+            b'/' => $callback!($i, $start, $fmt, $bytes, "&#x2f;"),
             _ => (),
         }
-    }};
+    };
 }
 
 macro_rules! write_char {
@@ -148,19 +145,28 @@ macro_rules! write_char {
         let b = *$ptr;
         if b.wrapping_sub(FLAG_BELOW) <= LEN {
             // Unsafe
-            escaping_bodies!($i, b, $start, $fmt, $bytes);
+            bodies!($i, b, $start, $fmt, $bytes, escaping_body);
         }
     }};
 }
 
-macro_rules! write_mask_body {
-    ($mask: ident, $cur: ident, $at:ident, $ptr: ident, $start: ident, $fmt: ident, $bytes:ident) => {
+#[allow(unused_macros)]
+macro_rules! mask_body {
+    ($i:expr, $start:ident, $fmt:ident, $bytes:ident, $quote:expr) => {{
+        let i = $i;
+        // Unsafe
+        escaping_body!(i, $start, $fmt, $bytes, $quote);
+    }};
+}
+
+#[allow(unused_macros)]
+macro_rules! mask_bodies {
+    ($mask: ident, $at:ident, $cur: ident, $ptr: ident, $start: ident, $fmt: ident, $bytes:ident) => {
         // Unsafe
         let b = *$ptr.add($cur);
-        let i = $at + $cur;
 
         // Unsafe
-        escaping_bodies!(i, b, $start, $fmt, $bytes);
+        bodies!($at + $cur, b, $start, $fmt, $bytes, mask_body);
 
         $mask ^= 1 << $cur;
         if $mask == 0 {
@@ -170,33 +176,32 @@ macro_rules! write_mask_body {
         $cur = $mask.trailing_zeros() as usize;
     };
 }
-// Unsafe
+
+#[allow(unused_macros)]
 macro_rules! write_mask {
-    ($cmp: ident, $ptr: ident, $start_ptr: ident, $start: ident, $fmt: ident, $bytes:ident) => {{
-        let mut mask = _mm256_movemask_epi8($cmp);
-        if mask != 0 {
-            let at = sub($ptr, $start_ptr);
-            let mut cur = mask.trailing_zeros() as usize;
+    ($mask: ident, $ptr: ident, $start_ptr: ident, $start: ident, $fmt: ident, $bytes:ident) => {{
+        let at = sub($ptr, $start_ptr);
+        let mut cur = $mask.trailing_zeros() as usize;
 
-            loop {
-                write_mask_body!(mask, cur, at, $ptr, $start, $fmt, $bytes);
-            }
-
-            debug_assert_eq!(at, sub($ptr, $start_ptr))
+        loop {
+            // Unsafe
+            mask_bodies!($mask, at, cur, $ptr, $start, $fmt, $bytes);
         }
+
+        debug_assert_eq!(at, sub($ptr, $start_ptr))
     }};
 }
 
-// Unsafe
+#[allow(unused_macros)]
 macro_rules! write_forward {
-    ($cmp: ident, $align: ident, $ptr: ident, $start_ptr: ident, $start: ident, $fmt: ident, $bytes:ident) => {{
-        let mut mask = _mm256_movemask_epi8($cmp);
-        if mask != 0 {
+    ($mask: ident, $align: ident, $ptr: ident, $start_ptr: ident, $start: ident, $fmt: ident, $bytes:ident) => {{
+        if $mask != 0 {
             let at = sub($ptr, $start_ptr);
-            let mut cur = mask.trailing_zeros() as usize;
+            let mut cur = $mask.trailing_zeros() as usize;
 
             while cur < $align {
-                write_mask_body!(mask, cur, at, $ptr, $start, $fmt, $bytes);
+                // Unsafe
+                mask_bodies!($mask, at, cur, $ptr, $start, $fmt, $bytes);
             }
 
             debug_assert_eq!(at, sub($ptr, $start_ptr))
@@ -218,6 +223,10 @@ fn _escape(bytes: &[u8], fmt: &mut Formatter) -> fmt::Result {
 
 #[cfg(all(target_arch = "x86_64", askama_runtime_avx))]
 unsafe fn _avx_escape(bytes: &[u8], fmt: &mut Formatter) -> fmt::Result {
+    const VECTOR_SIZE: usize = size_of::<__m256i>();
+    const VECTOR_ALIGN: usize = VECTOR_SIZE - 1;
+    const LOOP_SIZE: usize = 4 * VECTOR_SIZE;
+
     let len = bytes.len();
     let mut start = 0;
 
@@ -240,37 +249,44 @@ unsafe fn _avx_escape(bytes: &[u8], fmt: &mut Formatter) -> fmt::Result {
     let end_ptr = bytes[len..].as_ptr();
     let mut ptr = start_ptr;
 
-    {
-        let align = (start_ptr as usize & VECTOR_ALIGN) % VECTOR_SIZE;
-        if 0 < align {
-            let a = _mm256_loadu_si256(ptr as *const __m256i);
-            let cmp = _mm256_cmpgt_epi8(v_flag, _mm256_sub_epi8(a, v_flag_below));
-
-            write_forward!(cmp, align, ptr, start_ptr, start, fmt, bytes);
-            ptr = ptr.add(align);
-
-            debug_assert!(start <= sub(ptr, start_ptr));
-        }
-    }
-
     debug_assert!(start_ptr <= ptr && start_ptr <= end_ptr.sub(VECTOR_SIZE));
 
     if LOOP_SIZE <= len {
+        {
+            let align = start_ptr as usize & VECTOR_ALIGN;
+            if 0 < align {
+                let a = _mm256_loadu_si256(ptr as *const __m256i);
+                let cmp = _mm256_cmpgt_epi8(v_flag, _mm256_sub_epi8(a, v_flag_below));
+                let mut mask = _mm256_movemask_epi8(cmp);
+
+                write_forward!(mask, align, ptr, start_ptr, start, fmt, bytes);
+                ptr = ptr.add(align);
+
+                debug_assert!(start <= sub(ptr, start_ptr));
+            }
+        }
+
         while ptr <= end_ptr.sub(LOOP_SIZE) {
             debug_assert_eq!(0, (ptr as usize) % VECTOR_SIZE);
 
             let a = _mm256_load_si256(ptr as *const __m256i);
             let b = _mm256_load_si256(ptr.add(VECTOR_SIZE) as *const __m256i);
+            let c = _mm256_load_si256(ptr.add(VECTOR_SIZE * 2) as *const __m256i);
+            let d = _mm256_load_si256(ptr.add(VECTOR_SIZE * 3) as *const __m256i);
             let cmp_a = _mm256_cmpgt_epi8(v_flag, _mm256_sub_epi8(a, v_flag_below));
             let cmp_b = _mm256_cmpgt_epi8(v_flag, _mm256_sub_epi8(b, v_flag_below));
+            let cmp_c = _mm256_cmpgt_epi8(v_flag, _mm256_sub_epi8(c, v_flag_below));
+            let cmp_d = _mm256_cmpgt_epi8(v_flag, _mm256_sub_epi8(d, v_flag_below));
+            let or1 = _mm256_or_si256(cmp_a, cmp_b);
+            let or2 = _mm256_or_si256(cmp_c, cmp_d);
 
-            if _mm256_movemask_epi8(_mm256_or_si256(cmp_a, cmp_b)) != 0 {
-                write_mask!(cmp_a, ptr, start_ptr, start, fmt, bytes);
-                let ptr = ptr.add(VECTOR_SIZE);
+            if _mm256_movemask_epi8(_mm256_or_si256(or1, or2)) != 0 {
+                let mut mask = _mm256_movemask_epi8(cmp_a) as i128
+                    | (_mm256_movemask_epi8(cmp_b) as i128) << VECTOR_SIZE
+                    | (_mm256_movemask_epi8(cmp_c) as i128) << VECTOR_SIZE * 2
+                    | (_mm256_movemask_epi8(cmp_d) as i128) << VECTOR_SIZE * 3;
 
-                debug_assert!(start <= sub(ptr, start_ptr));
-
-                write_mask!(cmp_b, ptr, start_ptr, start, fmt, bytes);
+                write_mask!(mask, ptr, start_ptr, start, fmt, bytes);
             }
 
             ptr = ptr.add(LOOP_SIZE);
@@ -279,13 +295,14 @@ unsafe fn _avx_escape(bytes: &[u8], fmt: &mut Formatter) -> fmt::Result {
         }
     }
 
-    if ptr <= end_ptr.sub(VECTOR_SIZE) {
-        debug_assert_eq!(0, (ptr as usize) % VECTOR_SIZE);
-
-        let a = _mm256_load_si256(ptr as *const __m256i);
+    while ptr <= end_ptr.sub(VECTOR_SIZE) {
+        let a = _mm256_loadu_si256(ptr as *const __m256i);
         let cmp = _mm256_cmpgt_epi8(v_flag, _mm256_sub_epi8(a, v_flag_below));
+        let mut mask = _mm256_movemask_epi8(cmp);
 
-        write_mask!(cmp, ptr, start_ptr, start, fmt, bytes);
+        if mask != 0 {
+            write_mask!(mask, ptr, start_ptr, start, fmt, bytes);
+        }
         ptr = ptr.add(VECTOR_SIZE);
 
         debug_assert!(start <= sub(ptr, start_ptr));
@@ -294,17 +311,79 @@ unsafe fn _avx_escape(bytes: &[u8], fmt: &mut Formatter) -> fmt::Result {
     debug_assert!(end_ptr.sub(VECTOR_SIZE) < ptr);
 
     if ptr < end_ptr {
-        debug_assert_eq!(0, (ptr as usize) % VECTOR_SIZE);
-
-        let a = _mm256_load_si256(ptr as *const __m256i);
+        let a = _mm256_loadu_si256(ptr as *const __m256i);
         let cmp = _mm256_cmpgt_epi8(v_flag, _mm256_sub_epi8(a, v_flag_below));
         let end = sub(end_ptr, ptr);
+        let mut mask = _mm256_movemask_epi8(cmp);
 
-        write_forward!(cmp, end, ptr, start_ptr, start, fmt, bytes);
+        write_forward!(mask, end, ptr, start_ptr, start, fmt, bytes);
     }
 
     debug_assert!(start <= len);
 
+    if start < len {
+        fmt.write_str(str::from_utf8_unchecked(&bytes[start..len]))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", askama_runtime_sse))]
+unsafe fn _sse_escape(bytes: &[u8], fmt: &mut Formatter) -> fmt::Result {
+    const VECTOR_SIZE: usize = size_of::<__m128i>();
+
+    let len = bytes.len();
+    let mut start = 0;
+
+    if len < VECTOR_SIZE {
+        for (i, b) in bytes.iter().enumerate() {
+            write_char!(i, b, start, fmt, bytes);
+        }
+
+        if start < len {
+            fmt.write_str(str::from_utf8_unchecked(&bytes[start..len]))?;
+        }
+
+        return Ok(());
+    }
+
+    const NEEDLE_LEN: i32 = 6;
+    let needle = _mm_setr_epi8(
+        b'<' as i8, b'>' as i8, b'&' as i8, b'"' as i8,
+        b'\'' as i8, b'/' as i8, 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+    );
+
+    let start_ptr = bytes.as_ptr();
+    let end_ptr = bytes[len..].as_ptr();
+    let mut ptr = start_ptr;
+
+    while ptr <= end_ptr.sub(VECTOR_SIZE) {
+        let a = _mm_loadu_si128(ptr as *const __m128i);
+        let cmp = _mm_cmpestrm(needle, NEEDLE_LEN, a, VECTOR_SIZE as i32, 0);
+        let mut mask = _mm_extract_epi16(cmp, 0) as i16;
+        if mask != 0 {
+            write_mask!(mask, ptr, start_ptr, start, fmt, bytes);
+        }
+
+        ptr = ptr.add(VECTOR_SIZE);
+
+        debug_assert!(start <= sub(ptr, start_ptr));
+    }
+
+    debug_assert!(end_ptr.sub(VECTOR_SIZE) < ptr);
+
+    if ptr < end_ptr {
+        let end = sub(end_ptr, ptr);
+        let a = _mm_loadu_si128(ptr as *const __m128i);
+        let cmp = _mm_cmpestrm(needle, NEEDLE_LEN, a, VECTOR_SIZE as i32, 0);
+        let mut mask = _mm_extract_epi16(cmp, 0) as i16;
+
+        write_forward!(mask, end, ptr, start_ptr, start, fmt, bytes);
+    }
+
+    debug_assert!(start <= len);
     if start < len {
         fmt.write_str(str::from_utf8_unchecked(&bytes[start..len]))?;
     }
@@ -322,25 +401,34 @@ mod tests {
 
     #[test]
     fn test_escape() {
-        assert_eq!(escape("").to_string(), "");
-        assert_eq!(escape("<&>").to_string(), "&lt;&amp;&gt;");
-        assert_eq!(escape("bar&").to_string(), "bar&amp;");
-        assert_eq!(escape("<foo").to_string(), "&lt;foo");
-        assert_eq!(escape("bar&h").to_string(), "bar&amp;h");
-    }
-
-    #[cfg(all(target_arch = "x86_64", askama_runtime_avx))]
-    #[test]
-    fn test_avx_escape() {
         let escapes = "<>&\"'/";
         let escaped = "&lt;&gt;&amp;&quot;&#x27;&#x2f;";
-        let string_long: &str = &["foobar"; 1024].join("");
+        let string_long: &str = &"foobar".repeat(1024);
 
         assert_eq!(escape("").to_string(), "");
         assert_eq!(escape("<&>").to_string(), "&lt;&amp;&gt;");
         assert_eq!(escape("bar&").to_string(), "bar&amp;");
         assert_eq!(escape("<foo").to_string(), "&lt;foo");
         assert_eq!(escape("bar&h").to_string(), "bar&amp;h");
+        assert_eq!(
+            escape("// my <html> is \"unsafe\" & should be 'escaped'").to_string(),
+            "&#x2f;&#x2f; my &lt;html&gt; is &quot;unsafe&quot; &amp; \
+             should be &#x27;escaped&#x27;"
+        );
+        assert_eq!(escape(&"<".repeat(16)).to_string(), "&lt;".repeat(16));
+        assert_eq!(escape(&"<".repeat(32)).to_string(), "&lt;".repeat(32));
+        assert_eq!(escape(&"<".repeat(64)).to_string(), "&lt;".repeat(64));
+        assert_eq!(escape(&"<".repeat(128)).to_string(), "&lt;".repeat(128));
+        assert_eq!(escape(&"<".repeat(1024)).to_string(), "&lt;".repeat(1024));
+        assert_eq!(escape(&"<".repeat(129)).to_string(), "&lt;".repeat(129));
+        assert_eq!(
+            escape(&"<".repeat(128 * 2 - 1)).to_string(),
+            "&lt;".repeat(128 * 2 - 1)
+        );
+        assert_eq!(
+            escape(&"<".repeat(128 * 8 - 1)).to_string(),
+            "&lt;".repeat(128 * 8 - 1)
+        );
         assert_eq!(escape(string_long).to_string(), string_long);
         assert_eq!(
             escape(&[string_long, "<"].join("")).to_string(),
@@ -351,12 +439,8 @@ mod tests {
             ["&lt;", string_long].join("")
         );
         assert_eq!(
-            escape(&["<"; 1024].join("")).to_string(),
-            ["&lt;"; 1024].join("")
-        );
-        assert_eq!(
-            escape(&[escapes; 1024].join("")).to_string(),
-            [escaped; 1024].join("")
+            escape(&escapes.repeat(1024)).to_string(),
+            escaped.repeat(1024)
         );
         assert_eq!(
             escape(&[string_long, "<", string_long].join("")).to_string(),
